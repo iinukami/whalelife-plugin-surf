@@ -1,0 +1,8 @@
+id: surf
+name: 网上冲浪
+version: 0.1.0
+description: 公开搜索、网页阅读与按需取图；平台登录和互动由子插件扩展
+apiVersion: "1.0.0"
+optionalDepends: [vision]
+console:
+  groupChildren: true
