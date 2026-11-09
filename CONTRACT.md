@@ -1,6 +1,6 @@
 # surf 服务契约
 
-服务版本 **1.0.0**，插件版本 **0.1.0**。公开类型为 `src/types.ts`，也由包入口导出。父插件单独可搜索/读公开网页，平台子插件不属于本版产物。
+服务版本 **1.0.0**，插件版本 **0.1.1**。公开类型为 `src/types.ts`，也由包入口导出。父插件单独可搜索/读公开网页，平台子插件不属于本版产物。本版兼容新增 `prepareCollection`、状态 `gallery` 与页面结果 `collectionToolAvailable`，旧方法和视觉返回语义保留。
 
 ## 消费方式
 
@@ -8,11 +8,12 @@
 
 | 方法 | 参数 | 返回 |
 | --- | --- | --- |
-| `status()` | 无 | 服务版本、ready、vision、配置有效性、搜索来源、当前请求数 |
+| `status()` | 无 | 服务版本、ready、vision、gallery、配置有效性、搜索来源、当前请求数 |
 | `settings()` | 无 | 当前实例使用的 PublicConfig，不含 Key、代理地址或凭据 |
 | `search(input, options?)` | `{sessionId, query, limit?}` | `OperationResult<SearchData>`，标题/链接/摘要，仅外部资料 |
 | `read(input, options?)` | `{sessionId, url}` 或 `{sessionId,pageRef,offset?}` | `OperationResult<PageData>`，正文片段、链接、图片索引、下一段偏移、是否截断 |
 | `image(input, options?)` | `{sessionId,pageRef,imageIndex}` | `OperationResult<ImageData>`，`offered`、mediaRef、过期时间、后续 vision_view |
+| `prepareCollection(input, options?)` | `{sessionId,pageRef,imageIndex}` | `OperationResult<GalleryImageData>`，`offered`、图库 mediaRef、过期时间、后续 gallery_collect |
 
 异步方法均接受 `{signal?:AbortSignal}`。`OperationResult` 为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。服务方法不自行生成聊天或工具回执，消费者必须通过临时工具传递外部结果。错误文字为固定说明，不包含源页面、搜索词、原始异常或凭据。
 
@@ -26,13 +27,17 @@
 
 图片仅接受页面提取出的索引，不允许模型直接指定任意 URL 或本地路径。获取 PNG/JPEG/WebP/GIF 的原始字节，经公开可选 vision `offerMedia({sessionId,mime,base64},{signal})` 交入；解码、缩放、裁剪及原生模型图片由视觉负责。没有视觉不注册 surf_image，已有文字工具继续工作。offered 不表示理解、收藏或发送；源插件不会另选模型或代为调用 vision_view。视觉停用/重载不沿用旧绑定或媒体缓存，不自动重放。
 
+`surf_prepare_collection` 仅在可选图库可用且宿主有临时工具时注册，不依赖视觉。明确需要收藏时按当前会话的有效 pageRef/imageIndex 获取图片，通过相同网络校验与下载限制，将原始字节调用 `gallery.offerMedia({sessionId,base64,source:'surf'},{signal})`。返回图库签发的 mediaRef 及 `nextTool:'gallery_collect'`；必须再由现有 `gallery_collect` 执行永久收藏及其权限判断。`surf_image` 的引用只能交视觉，不能交图库。普通 `read` / `image` 不调用图库接口。
+
+图库引用准备也有同页同图去重、在途占位与最多 32 个缓存引用；页面过期、跨会话或绑定失效均拒绝复用，重连不重放请求。图库独立管理暂存原图，公开服务无 release；在交入后取消或停用时，已交入的暂存图可能保留至其 TTL（当前 24 小时），不冒充已撤回或已收藏。真正收藏的原图、来源、描述及向量由图库按自身契约保存，surf 仅保留固定动作回执。
+
 ## 资源、失败与配置
 
 仅匿名 GET，默认无 Cookie/Authorization，不读取浏览器资料。仅配置选择 Brave 时对固定 HTTPS 官方端点传 Key，禁止携带该 Key 跟随重定向。固定公开 IP 建立连接；代理 CONNECT 同样使用已校验 IP，TLS 校验原始目标主机。压缩前后限量、最多 5 次跳转、限时、取消、插件停用均有明确结果。请求失败不自动重试、不切换付费源、不冒充零条搜索结果。
 
 配置保存不改在途实例，重载后生效。子插件通过公共方法共享父级能力；父级停止由宿主停止依赖它的子级，但某次搜索失败不令父级或所有子级失败。插件不另起后台调度，不自动追踪用户、网站或计划。
 
-主要错误：`invalid_input`、`unsafe_url`、`network_error`、`timeout`、`cancelled`、`stopped`、`too_large`、`too_many_redirects`、`access_blocked`、`http_error`、`unsupported_content`、`search_parse`、`search_unconfigured`、`page_unavailable`、`session_required`、`vision_unavailable`、`image_unavailable`、`busy`、`config_invalid`、`config_conflict`、`host_required`。工具外层 ok 与这里的业务 status 不可互相替代。
+主要错误：`invalid_input`、`unsafe_url`、`network_error`、`timeout`、`cancelled`、`stopped`、`too_large`、`too_many_redirects`、`access_blocked`、`http_error`、`unsupported_content`、`search_parse`、`search_unconfigured`、`page_unavailable`、`session_required`、`vision_unavailable`、`gallery_unavailable`、`image_unavailable`、`busy`、`config_invalid`、`config_conflict`、`host_required`。工具外层 ok 与这里的业务 status 不可互相替代。
 
 ## 隐私与兼容
 

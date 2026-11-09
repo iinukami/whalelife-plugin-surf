@@ -4,4 +4,4 @@
  */
 export { apply, applyWithDependencies } from './src/index.ts';
 export type { SurfService, SurfConfig, PublicConfig, SurfStatus, SearchInput, ReadInput, ImageInput,
-  OperationResult, SearchData, PageData, ImageData, CallOptions } from './src/types.ts';
+  OperationResult, SearchData, PageData, ImageData, GalleryImageData, CallOptions } from './src/types.ts';

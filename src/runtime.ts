@@ -8,10 +8,11 @@ import { publicConfig, object } from './config.ts';
 import { SurfError, safeError } from './errors.ts';
 import { parsePage, parseBing, parseDuckDuckGo, parseBrave } from './content.ts';
 import type { PublicFetcher, SurfConfig, SurfService, SurfStatus, OperationResult, ParsedPage,
-  SearchData, PageData, ImageData, SearchInput, ReadInput, ImageInput, CallOptions, VisionService } from './types.ts';
+  SearchData, PageData, ImageData, GalleryImageData, SearchInput, ReadInput, ImageInput, CallOptions, VisionService, GalleryService } from './types.ts';
 
 type StoredPage = ParsedPage & { sessionId: string; url: string; expires: number };
 type StoredOffer = { sessionId: string; binding: OptionalService<VisionService>; media: ImageData; expires: number };
+type StoredCollectionOffer = { sessionId: string; binding: OptionalService<GalleryService>; media: GalleryImageData; expires: number };
 const PAGE_CHUNK = 6000;
 function identity(input: unknown): string {
   if (typeof input !== 'string' || !input.trim() || input.length > 200 || /[\x00-\x1f\x7f]/.test(input)) throw new SurfError('session_required');
@@ -20,6 +21,18 @@ function identity(input: unknown): string {
 function checkResponse(status: number) {
   if ([401, 403, 429, 503].includes(status)) throw new SurfError('access_blocked');
   if (status < 200 || status > 299) throw new SurfError('http_error');
+}
+function untilCancelled<T>(signal: AbortSignal, task: () => Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(new SurfError('cancelled'));
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(new SurfError('cancelled')); };
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw new SurfError('cancelled');
+      return task();
+    }).then(value => { signal.removeEventListener('abort', abort); resolve(value); },
+      error => { signal.removeEventListener('abort', abort); reject(error); });
+  });
 }
 
 export class SurfRuntime implements SurfService {
@@ -36,6 +49,10 @@ export class SurfRuntime implements SurfService {
   private offers = new Map<string, StoredOffer>();
   private imageRequests = new Set<string>();
   private vision?: OptionalService<VisionService>;
+  private gallery?: OptionalService<GalleryService>;
+  private galleryAborter = new AbortController();
+  private collectionOffers = new Map<string, StoredCollectionOffer>();
+  private collectionRequests = new Set<string>();
   constructor(config: SurfConfig, fetcher: PublicFetcher, options: { signal: AbortSignal; transient: boolean; configValid: boolean; now?: () => number }) {
     this.config = { ...config }; this.fetcher = fetcher; this.now = options.now ?? Date.now;
     this.signal = AbortSignal.any([options.signal, this.aborter.signal]);
@@ -45,12 +62,19 @@ export class SurfRuntime implements SurfService {
     if (this.vision !== binding) this.offers.clear();
     this.vision = binding;
   }
+  setGallery(binding: OptionalService<GalleryService> | undefined) {
+    if (this.gallery === binding) return;
+    this.galleryAborter.abort(); this.galleryAborter = new AbortController();
+    this.collectionOffers.clear(); this.gallery = binding;
+  }
   status(): SurfStatus {
     return { version: '1.0.0', ready: !this.stopped && !this.signal.aborted && this.transient && this.configValid,
-      configValid: this.configValid, vision: this.visionAvailable(), searchProvider: this.config.searchProvider, activeRequests: this.active };
+      configValid: this.configValid, vision: this.visionAvailable(), gallery: this.galleryAvailable(),
+      searchProvider: this.config.searchProvider, activeRequests: this.active };
   }
   settings() { return publicConfig(this.config); }
   private visionAvailable() { return !this.stopped && !this.signal.aborted && Boolean(this.vision && !this.vision.signal.aborted); }
+  private galleryAvailable() { return !this.stopped && !this.signal.aborted && Boolean(this.gallery && !this.gallery.signal.aborted); }
   private async execute<T>(sessionId: unknown, options: CallOptions | undefined, task: (session: string, signal: AbortSignal) => Promise<T>): Promise<OperationResult<T>> {
     let entered = false;
     try {
@@ -73,6 +97,7 @@ export class SurfRuntime implements SurfService {
   private prune() {
     for (const [ref, page] of this.pages) if (page.expires <= this.now()) this.pages.delete(ref);
     for (const [key, offer] of this.offers) if (offer.expires <= this.now() || offer.binding.signal.aborted) this.offers.delete(key);
+    for (const [key, offer] of this.collectionOffers) if (offer.expires <= this.now() || offer.binding.signal.aborted) this.collectionOffers.delete(key);
   }
   private async releaseOffer(binding: OptionalService<VisionService>, sessionId: string, mediaRef: string) {
     if (binding.signal.aborted) return;
@@ -141,7 +166,8 @@ export class SurfRuntime implements SurfService {
         ...(end < page.text.length ? { nextOffset: end } : {}), truncated: page.truncated,
         expiresAt: new Date(page.expires).toISOString(), links: page.links,
         images: page.images.map((item, index) => ({ index, alt: item.alt })),
-        imageToolAvailable: this.visionAvailable(), untrusted: true, ...(page.notice ? { notice: page.notice } : {}) };
+        imageToolAvailable: this.visionAvailable(), collectionToolAvailable: this.galleryAvailable(),
+        untrusted: true, ...(page.notice ? { notice: page.notice } : {}) };
     });
   }
   image(input: ImageInput & { sessionId: string }, options?: CallOptions): Promise<OperationResult<ImageData>> {
@@ -182,9 +208,56 @@ export class SurfRuntime implements SurfService {
       } finally { this.imageRequests.delete(key); }
     });
   }
+  prepareCollection(input: ImageInput & { sessionId: string }, options?: CallOptions): Promise<OperationResult<GalleryImageData>> {
+    return this.execute(input?.sessionId, options, async (session, signal) => {
+      object(input);
+      const page = this.page(session, input.pageRef), binding = this.gallery;
+      if (!binding || binding.signal.aborted) throw new SurfError('gallery_unavailable');
+      if (!Number.isInteger(input.imageIndex) || input.imageIndex < 0 || input.imageIndex >= page.images.length) throw new SurfError('invalid_input');
+      const key = `${input.pageRef}:${input.imageIndex}`;
+      const cached = this.collectionOffers.get(key);
+      if (cached && cached.binding === binding && cached.sessionId === session && cached.expires > this.now()) return cached.media;
+      if (this.collectionRequests.has(key) || this.collectionOffers.size + this.collectionRequests.size >= 32) throw new SurfError('busy');
+      this.collectionRequests.add(key);
+      const bindingSignal = this.galleryAborter.signal;
+      const combined = AbortSignal.any([signal, binding.signal, bindingSignal]);
+      try {
+        const response = await untilCancelled(combined, () => this.fetcher.get(page.images[input.imageIndex].url, { signal: combined,
+          timeoutMs: this.config.timeoutMs, maxBytes: this.config.maxImageBytes, proxyUrl: this.config.proxyUrl,
+          headers: { Accept: 'image/png,image/jpeg,image/webp,image/gif' } }));
+        checkResponse(response.status);
+        const mime = (response.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+        if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mime)) throw new SurfError('unsupported_content');
+        this.page(session, input.pageRef);
+        if (combined.aborted) throw new SurfError('cancelled');
+        const offeredAt = this.now();
+        let offered: Awaited<ReturnType<GalleryService['offerMedia']>>;
+        try {
+          offered = await untilCancelled(combined, () => binding.service.offerMedia({
+            sessionId: session, base64: response.body.toString('base64'), source: 'surf',
+          }, { signal: combined }));
+        } catch { throw new SurfError(combined.aborted ? 'cancelled' : 'image_unavailable'); }
+        if (combined.aborted) throw new SurfError('cancelled');
+        this.page(session, input.pageRef);
+        if (!offered || typeof offered.mediaRef !== 'string' || !offered.mediaRef.trim() || offered.mediaRef.length > 80
+          || /[\x00-\x1f\x7f]/.test(offered.mediaRef) || typeof offered.expiresInSeconds !== 'number'
+          || !Number.isFinite(offered.expiresInSeconds) || offered.expiresInSeconds <= 0) throw new SurfError('image_unavailable');
+        // Start at the call, so transport latency never extends the provider's declared lifetime.
+        const expires = offeredAt + offered.expiresInSeconds * 1000;
+        if (!Number.isFinite(expires) || expires > 8.64e15 || expires <= this.now()) throw new SurfError('image_unavailable');
+        const media: GalleryImageData = { mediaRef: offered.mediaRef, expiresAt: new Date(expires).toISOString(), nextTool: 'gallery_collect', state: 'offered' };
+        this.collectionOffers.set(key, { sessionId: session, binding, media, expires: Math.min(expires, page.expires) });
+        return media;
+      } catch (error) {
+        if (binding.signal.aborted || bindingSignal.aborted || this.gallery !== binding) throw new SurfError('gallery_unavailable');
+        throw error;
+      } finally { this.collectionRequests.delete(key); }
+    });
+  }
   async dispose() {
     if (this.stopped) return;
     this.stopped = true; this.aborter.abort(); this.pages.clear(); this.vision = undefined;
+    this.galleryAborter.abort(); this.gallery = undefined; this.collectionOffers.clear(); this.collectionRequests.clear();
     const offers = [...this.offers.values()]; this.offers.clear(); this.imageRequests.clear();
     await this.fetcher.dispose();
     await Promise.all(offers.map(offer => this.releaseOffer(offer.binding, offer.sessionId, offer.media.mediaRef)));

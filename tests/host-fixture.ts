@@ -12,6 +12,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { temporaryDirectory, root } from './temporary-directory.ts';
 
 export const CURRENT_HOST = 'bfc7639e69358f2d981faf8a4554656d0dc70b12';
+// Add current-host coverage without moving the already verified 2026-11-07 baseline.
+export const HOST_20261109 = '38af5e72e466dd6da7f390e445cd1e6cc2f02a69';
 // RELEASING.md preserves this named compatibility tag; the old short hash is ambiguous.
 export const MINIMUM_HOST = 'refs/tags/213b52b';
 const MINIMUM_HOST_COMMIT = '7c8e3898b2bc7cb0b892eb0ab2feec0ca9c8aaf0';
@@ -21,6 +23,8 @@ export const QUERY = 'SYNTHETIC_SURF_PRIVATE_QUERY_DO_NOT_PERSIST';
 export const ARG_SECRET = 'SYNTHETIC_SURF_ARGUMENT_SECRET';
 export const ERROR_SECRET = 'SYNTHETIC_SURF_ERROR_CREDENTIAL';
 export const SAVED_SECRET = 'SYNTHETIC_SURF_SAVED_API_KEY';
+export const GALLERY_ERROR = 'SYNTHETIC_GALLERY_ERROR_DO_NOT_PERSIST';
+export const IMAGE_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=';
 export const PAGE_URL = 'https://surf-fixture.example/article?private=' + ARG_SECRET;
 const host = resolve(root, '../whalelife');
 
@@ -53,7 +57,9 @@ export async function hostFixture(t: TestContext, baseline = CURRENT_HOST) {
   const revision = spawnSync('git', ['-C', host, 'rev-parse', '--verify', baseline + '^{commit}'],
     { encoding: 'utf8', windowsHide: true, timeout: 15000 });
   assert.equal(revision.status, 0, revision.stderr || revision.error?.message);
-  assert.equal(revision.stdout.trim(), baseline === MINIMUM_HOST ? MINIMUM_HOST_COMMIT : CURRENT_HOST,
+  const expected = new Map([[MINIMUM_HOST, MINIMUM_HOST_COMMIT], [CURRENT_HOST, CURRENT_HOST], [HOST_20261109, HOST_20261109]]).get(baseline);
+  assert.ok(expected, 'hostFixture requires an explicitly pinned host baseline');
+  assert.equal(revision.stdout.trim(), expected,
     'a frozen host test baseline must not silently move');
   const git = spawnSync('git', ['-C', host, 'archive', '--format=tar', '--output=' + archive, revision.stdout.trim(), 'core', 'package.json'],
     { encoding: 'utf8', windowsHide: true, timeout: 15000 });
@@ -105,7 +111,7 @@ import { SurfError } from ${JSON.stringify(pathToFileURL(join(root, 'src/errors.
 export async function apply(ctx) {
   let now = Date.now(), calls = 0, waiting = false, cancelled = 0, disposed = false;
   const rawPage = ${JSON.stringify(RAW_PAGE)}, rawSearch = ${JSON.stringify(RAW_SEARCH)};
-  const image = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=', 'base64');
+  const image = Buffer.from(${JSON.stringify(IMAGE_BASE64)}, 'base64');
   const fetcher = {
     async get(url, options) {
       calls++;
@@ -202,4 +208,48 @@ export async function installVision(f: Awaited<ReturnType<typeof hostFixture>>) 
     });
   }`);
   await f.load('vision');
+}
+
+/** Matches gallery's published offerMedia shape. The collect tool only changes in-memory counters. */
+export async function installGallery(f: Awaited<ReturnType<typeof hostFixture>>) {
+  await f.plugin('gallery', `export function apply(ctx) {
+    let offers = 0, collects = 0, rejectedCollects = 0, waiting = false, mode = 'normal';
+    let lastSession, lastSource, originalVerified = false;
+    const instanceId = crypto.randomUUID();
+    const references = new Map();
+    ctx.provide('gallery', {
+      async offerMedia(input, options) {
+        const signal = options?.signal ? AbortSignal.any([ctx.signal, options.signal]) : ctx.signal;
+        signal.throwIfAborted();
+        if (!input.sessionId || input.base64 !== ${JSON.stringify(IMAGE_BASE64)} ||
+            Object.keys(input).some(key => !['sessionId','base64','source'].includes(key))) throw Error('Malformed synthetic gallery media');
+        offers++; lastSession = input.sessionId; lastSource = input.source; originalVerified = true;
+        if (mode === 'error') throw Error(${JSON.stringify(GALLERY_ERROR)} + input.base64);
+        if (mode === 'wait') {
+          waiting = true;
+          await new Promise((resolve, reject) => {
+            const cleanup = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); waiting = false; };
+            const abort = () => { cleanup(); reject(Error('Synthetic gallery offer cancelled')); };
+            const timer = setTimeout(() => { cleanup(); reject(Error('Synthetic gallery fixture deadline')); }, 2500);
+            signal.addEventListener('abort', abort, {once:true});
+            if (signal.aborted) abort();
+          });
+        }
+        const mediaRef = 'synthetic-gallery-' + instanceId + '-' + offers;
+        references.set(mediaRef, {sessionId:input.sessionId});
+        return {mediaRef,expiresInSeconds:86400};
+      },
+      mode(value) { mode = value; },
+      stats() { return {offers,collects,rejectedCollects,waiting,lastSession,lastSource,originalVerified,pid:process.pid}; }
+    });
+    ctx.tools.register({name:'gallery_collect',description:'Synthetic in-memory collection check',danger:'safe',
+      schema:{type:'object',properties:{mediaRef:{type:'string'}},required:['mediaRef'],additionalProperties:false},
+      run(args, session) {
+        const reference = references.get(args.mediaRef);
+        if (!reference || reference.sessionId !== session.id) { rejectedCollects++; return {status:'error',code:'media_unavailable'}; }
+        collects++; return {state:'saved',id:'synthetic-collected-item-' + collects};
+      }
+    });
+  }`);
+  await f.load('gallery');
 }

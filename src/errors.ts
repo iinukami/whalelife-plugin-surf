@@ -10,7 +10,8 @@ export const messages = {
   unsupported_content: '首版只支持 HTML、纯文字和图片，不执行网页脚本或读取视频。',
   search_parse: '未能识别搜索结果，来源页面可能已变化。', search_unconfigured: '所选搜索服务尚未配置。',
   page_unavailable: '页面引用不可用，请在当前会话重新读取。', session_required: '缺少可信当前会话。',
-  vision_unavailable: '视觉服务不可用；文字阅读仍可使用。', image_unavailable: '未能准备图片，请稍后重新选择。',
+  vision_unavailable: '视觉服务不可用；文字阅读仍可使用。', gallery_unavailable: '图库服务不可用；文字阅读和已有看图能力仍可使用。',
+  image_unavailable: '未能准备图片，请稍后重新选择。',
   busy: '当前浏览请求已满，请等待已发起的请求完成。', config_invalid: '配置无效。',
   config_conflict: '配置已被其他页面修改，请刷新后再保存。', host_required: '宿主缺少临时工具接口，请升级宿主。',
 } as const;

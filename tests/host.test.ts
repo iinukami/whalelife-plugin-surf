@@ -6,8 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { CURRENT_HOST, MINIMUM_HOST, RAW_PAGE, RAW_SEARCH, QUERY, ARG_SECRET, ERROR_SECRET,
-  SAVED_SECRET, PAGE_URL, hostFixture, installVision, until, diskText } from './host-fixture.ts';
+import { CURRENT_HOST, HOST_20261109, MINIMUM_HOST, RAW_PAGE, RAW_SEARCH, QUERY, ARG_SECRET, ERROR_SECRET,
+  SAVED_SECRET, GALLERY_ERROR, IMAGE_BASE64, PAGE_URL, hostFixture, installVision, installGallery, until, diskText } from './host-fixture.ts';
 
 const deadline = { timeout: 35000 };
 const toolCall = (name: string, args: unknown = {}) => ({ id: 'synthetic-' + name,
@@ -15,9 +15,9 @@ const toolCall = (name: string, args: unknown = {}) => ({ id: 'synthetic-' + nam
 const childService = (f: Awaited<ReturnType<typeof hostFixture>>) =>
   f.app.runtime.records.get('surf/platform-fixture').local.get('surf-child-test');
 
-for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
+for (const baseline of [CURRENT_HOST, HOST_20261109, MINIMUM_HOST]) {
   test(`real loadPath on ${baseline}: status, authenticated settings and explicit compatibility boundary`, deadline, async t => {
-    const f = await hostFixture(t, baseline), current = baseline === CURRENT_HOST;
+    const f = await hostFixture(t, baseline), current = baseline !== MINIMUM_HOST;
     const record = f.app.runtime.records.get('surf');
     assert.equal(record.manifest.console.groupChildren, true);
     assert.equal(f.app.runtime.records.get('surf/platform-fixture').status, 'active');
@@ -27,10 +27,12 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
     assert.equal(tools.includes('surf_read'), current);
     assert.equal(tools.includes('surf_search'), current);
     assert.equal(tools.includes('surf_image'), false);
+    assert.equal(tools.includes('surf_prepare_collection'), false);
     const status = await f.call('surf_status');
     assert.equal(status.ok, true);
     assert.equal(status.result.ready, current);
     assert.equal(status.result.vision, false);
+    assert.equal(status.result.gallery, false);
     assert.equal(status.result.configValid, true);
     assert.equal((await f.service().status()).ready, current);
     assert.equal((await childService(f).status()).ready, current);
@@ -79,6 +81,7 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
       for (const result of [
         await f.service().read({ sessionId: f.sessionId, url: PAGE_URL }),
         await f.service().search({ sessionId: f.sessionId, query: QUERY }),
+        await f.service().prepareCollection({ sessionId: f.sessionId, pageRef: 'synthetic-unavailable-page', imageIndex: 0 }),
       ]) {
         assert.equal(result.status, 'error');
         assert.equal(result.error.code, 'host_required');
@@ -88,9 +91,14 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
       assert.equal((await f.service('surf-test-fixture').stats()).calls, 0,
         'old host must not fetch external content or register a persistent fallback tool');
       await installVision(f);
+      await installGallery(f);
       assert.equal(f.names().includes('surf_image'), false, 'missing optional and transient APIs must remain safe');
+      assert.equal(f.names().includes('surf_prepare_collection'), false, 'old hosts must not register a persistent collection-preparation fallback');
+      assert.equal((await f.service().status()).gallery, false);
+      assert.equal((await f.service('gallery').stats()).offers, 0);
       assert.equal(f.app.runtime.records.get('surf').status, 'active');
       await f.app.runtime.action('vision', 'stop');
+      await f.app.runtime.action('gallery', 'stop');
       assert.equal(f.app.runtime.records.get('surf').status, 'active');
     }
     assert.equal(f.requests.length, 0, 'status and settings cannot invoke a model');
@@ -110,6 +118,7 @@ test('current host keeps raw content, follow-up arguments and credentials out of
   assert.ok(read.result.data.text.includes(RAW_PAGE));
   assert.equal(read.result.data.untrusted, true);
   assert.equal(read.result.data.imageToolAvailable, false);
+  assert.equal(read.result.data.collectionToolAvailable, false);
   const pageRef = read.result.data.pageRef;
   assert.ok(pageRef);
   const unsafeError = await f.call('surf_read', { url: 'https://surf-fixture.example/error?token=' + ARG_SECRET });
@@ -156,6 +165,142 @@ test('current host keeps raw content, follow-up arguments and credentials out of
   const pluginData = await diskText(join(f.surf, 'data'));
   for (const marker of [RAW_PAGE, RAW_SEARCH, QUERY, pageRef, ARG_SECRET, ERROR_SECRET]) assert.ok(!pluginData.includes(marker));
 });
+
+for (const baseline of [CURRENT_HOST, HOST_20261109]) {
+  test(`gallery preparation on ${baseline}: optional lifecycle, original bytes, trusted references and transient receipts`, deadline, async t => {
+    const f = await hostFixture(t, baseline), parentPid = f.app.runtime.records.get('surf').execution.pid;
+    const references: string[] = [];
+    const read = await f.call('surf_read', { url: PAGE_URL });
+    assert.equal(read.result.status, 'ok');
+    const pageRef = read.result.data.pageRef;
+    references.push(pageRef);
+    assert.equal(read.result.data.collectionToolAvailable, false);
+    assert.equal(read.result.data.imageToolAvailable, false);
+    assert.equal(f.names().includes('surf_prepare_collection'), false);
+    const noGallery = await f.service().prepareCollection({ sessionId: f.sessionId, pageRef, imageIndex: 0 });
+    assert.equal(noGallery.status, 'error');
+    assert.equal((await f.service('surf-test-fixture').stats()).calls, 1, 'missing gallery does not fetch image bytes');
+
+    await installGallery(f);
+    await until(async () => (await f.service().status()).gallery && f.names().includes('surf_prepare_collection'), 'gallery binding did not become ready');
+    assert.equal(f.names().includes('surf_image'), false, 'collection preparation must not require vision');
+    const entry = f.app.tools.entries.get('surf_prepare_collection');
+    assert.equal(entry.transientResult, true);
+    assert.equal(entry.danger, 'safe');
+    assert.equal(f.app.runtime.records.get('surf').dependencies.has('gallery'), false);
+    assert.equal(f.app.runtime.records.get('surf').execution.pid, parentPid);
+    const reread = await f.call('surf_read', { pageRef });
+    assert.equal(reread.result.data.collectionToolAvailable, true);
+    assert.equal(reread.result.data.imageToolAvailable, false);
+    const otherSession = await f.app.sessions.create('Synthetic unrelated collection session');
+    const wrongSession = await f.call('surf_prepare_collection', { pageRef, imageIndex: 0, sessionId: f.sessionId }, otherSession);
+    assert.equal(wrongSession.result.status, 'error');
+    assert.equal((await f.service('gallery').stats()).offers, 0, 'model sessionId cannot replace the trusted session');
+
+    const prepared = await f.call('surf_prepare_collection', { pageRef, imageIndex: 0 });
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.result.status, 'ok');
+    const galleryRef = prepared.result.data.mediaRef;
+    references.push(galleryRef);
+    assert.match(galleryRef, /^synthetic-gallery-/);
+    assert.equal(prepared.result.data.state, 'offered');
+    assert.equal(prepared.result.data.nextTool, 'gallery_collect');
+    assert.ok(Number.isFinite(Date.parse(prepared.result.data.expiresAt)));
+    const galleryState = await f.service('gallery').stats();
+    assert.equal(galleryState.originalVerified, true);
+    assert.equal(galleryState.lastSession, f.sessionId);
+    assert.equal(galleryState.collects, 0, 'offering bytes is not a collection');
+    assert.equal(f.requests.length, 0, 'preparation cannot invoke a model');
+
+    await installVision(f);
+    await until(() => f.names().includes('surf_image'), 'vision did not become ready alongside gallery');
+    const viewed = await f.call('surf_image', { pageRef, imageIndex: 0 });
+    assert.equal(viewed.result.status, 'ok');
+    const visionRef = viewed.result.data.mediaRef;
+    references.push(visionRef);
+    assert.notEqual(visionRef, galleryRef);
+    assert.equal(viewed.result.data.nextTool, 'vision_view');
+    assert.equal((await f.service('vision').stats()).offers, 1, 'gallery preparation did not offer to vision');
+    const collectInContext = (mediaRef: string, sessionId = f.sessionId) => f.app.tools.call('gallery_collect', { mediaRef },
+      { id: sessionId, permission: 'full', transientContext: true });
+    assert.equal((await collectInContext(visionRef)).result.status, 'error', 'vision references are not gallery references');
+    assert.equal((await collectInContext(galleryRef, otherSession)).result.status, 'error', 'gallery references remain bound to their own session');
+    assert.equal((await f.service('gallery').stats()).collects, 0);
+
+    await f.plugin('gallery-dialogue', `export function apply(ctx) {
+      ctx.provide('gallery-dialogue', {run:input=>ctx.sessions.run(input)});
+    }`);
+    await f.load('gallery-dialogue');
+    let round = 0;
+    const finalText = '合成测试中的图片已完成模拟收藏。SYNTHETIC_GALLERY_VISIBLE_REPLY';
+    f.model(request => {
+      round++;
+      if (round === 1) return { text: '', toolCalls: [toolCall('surf_prepare_collection', { pageRef, imageIndex: 0 })] };
+      if (round === 2) {
+        const serialized = JSON.stringify(request.messages);
+        assert.ok(serialized.includes(galleryRef));
+        assert.ok(!serialized.includes(visionRef));
+        return { text: '', toolCalls: [toolCall('gallery_collect', { mediaRef: galleryRef })] };
+      }
+      assert.ok(request.messages.some((message: any) => message.role === 'tool' &&
+        typeof message.content === 'string' && message.content.includes('"state":"saved"')));
+      return { text: finalText, toolCalls: [] };
+    });
+    assert.equal(await f.service('gallery-dialogue').run({ sessionId: f.sessionId, text: '请走合成图片的模拟收藏流程', persona: 'a', permission: 'full' }), finalText);
+    assert.equal(round, 3);
+    assert.equal((await f.service('gallery').stats()).collects, 1);
+    assert.equal((await f.app.memory.readSession(f.sessionId)).at(-1).text, finalText,
+      'ordinary final conversation remains while raw media and tool arguments stay temporary');
+
+    const pendingPage = await f.call('surf_read', { url: PAGE_URL });
+    references.push(pendingPage.result.data.pageRef);
+    await f.service('gallery').mode('wait');
+    const pending = f.call('surf_prepare_collection', { pageRef: pendingPage.result.data.pageRef, imageIndex: 0 });
+    await until(async () => (await f.service('gallery').stats()).waiting, 'synthetic gallery offer did not enter its waiting phase');
+    await f.app.runtime.action('gallery', 'stop');
+    const cancelled = await pending;
+    assert.ok(!cancelled.ok || cancelled.result.status === 'error', 'provider stop cannot report a completed preparation');
+    await until(async () => !(await f.service().status()).gallery && !f.names().includes('surf_prepare_collection'), 'gallery tools survived provider stop');
+    assert.equal(f.app.runtime.records.get('surf').status, 'active');
+    assert.equal(f.app.runtime.records.get('surf/platform-fixture').status, 'active');
+    assert.equal(f.app.runtime.records.get('surf').execution.pid, parentPid);
+    assert.ok(f.names().includes('surf_read'));
+    assert.ok(f.names().includes('surf_image'));
+    const withoutGallery = await f.call('surf_read', { pageRef });
+    assert.equal(withoutGallery.result.data.collectionToolAvailable, false);
+    assert.equal(withoutGallery.result.data.imageToolAvailable, true);
+
+    await f.app.runtime.action('gallery', 'start');
+    await until(() => f.names().includes('surf_prepare_collection'), 'gallery tool did not return after restart');
+    assert.equal((await f.service('gallery').stats()).offers, 0, 'provider restart cannot replay offers');
+    assert.equal((await f.service('gallery').stats()).collects, 0, 'provider restart cannot replay collections');
+    assert.equal((await collectInContext(galleryRef)).result.status, 'error', 'an old provider reference cannot become valid on restart');
+    const restarted = await f.call('surf_prepare_collection', { pageRef, imageIndex: 0 });
+    assert.equal(restarted.result.status, 'ok');
+    assert.notEqual(restarted.result.data.mediaRef, galleryRef);
+    references.push(restarted.result.data.mediaRef);
+    await f.app.runtime.action('gallery', 'reload');
+    await until(() => f.names().includes('surf_prepare_collection'), 'gallery tool did not return after reload');
+    assert.equal((await f.service('gallery').stats()).offers, 0, 'reload cannot replay a completed preparation');
+    assert.equal((await f.service('vision').stats()).offers, 1, 'gallery lifecycle must not reuse or recreate a vision offer');
+    await f.app.runtime.action('vision', 'stop');
+    await until(() => !f.names().includes('surf_image'), 'vision tool did not stop');
+    assert.ok(f.names().includes('surf_prepare_collection'), 'vision stop must not revoke gallery preparation');
+    const galleryOnly = await f.call('surf_read', { pageRef });
+    assert.equal(galleryOnly.result.data.collectionToolAvailable, true);
+    assert.equal(galleryOnly.result.data.imageToolAvailable, false);
+
+    await f.service('gallery').mode('error');
+    const failed = await f.call('surf_prepare_collection', { pageRef, imageIndex: 0 });
+    assert.equal(failed.result.status, 'error');
+    assert.ok(!JSON.stringify(failed).includes(GALLERY_ERROR));
+    assert.ok(!JSON.stringify(failed).includes(IMAGE_BASE64));
+    assert.equal(f.app.runtime.records.get('surf').status, 'active');
+    await f.assertPrivate([...references, IMAGE_BASE64, GALLERY_ERROR]);
+    const pluginData = await diskText(join(f.surf, 'data'));
+    for (const marker of [...references, RAW_PAGE, IMAGE_BASE64, GALLERY_ERROR]) assert.ok(!pluginData.includes(marker));
+  });
+}
 
 test('optional vision arrives and stops independently; tools, trusted session and recovery remain correct', deadline, async t => {
   const f = await hostFixture(t), parentPid = f.app.runtime.records.get('surf').execution.pid;
