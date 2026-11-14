@@ -53,4 +53,4 @@ npm run build
 
 测试使用合成网页、图片、模拟搜索/视觉/图库及项目内 `.artifacts/tests/` 临时宿主，不调用付费模型或正式账号。宿主回归保留基线 `bfc7639e69358f2d981faf8a4554656d0dc70b12` 和冻结兼容标签 `refs/tags/213b52b`，图库接入另覆盖 2026-11-09 主干 `38af5e72e466dd6da7f390e445cd1e6cc2f02a69`。冻结旧宿主缺少临时工具时，只保留状态、设置和明确的 `host_required` 结果，不注册会泄露内容的普通替代工具。最低完整功能要求公开 `registerTransient`；可选识图还要求 `ctx.optional`、`registerMultimodal` 和视觉服务，可选收藏准备要求 `ctx.optional` 与图库服务，不凭 API 1.0.0 推断这些新增方法存在。
 
-原创代码采用 [AGPL-3.0-only](LICENSE) 及 [附加条款](LICENSE-ADDITIONAL)。第三方来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。开发会话负责验证和本地提交；远端 push、标签与 Release 由统一发布会话处理。
+开发会话负责验证和本地提交；远端 push、标签与 Release 由统一发布会话处理。
